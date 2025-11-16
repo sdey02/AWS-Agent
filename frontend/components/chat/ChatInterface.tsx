@@ -4,6 +4,7 @@ import { useState } from 'react';
 import MessageBubble from './MessageBubble';
 import SourceCard from './SourceCard';
 import FeedbackButton from './FeedbackButton';
+import ActionsPanel from '../actions/ActionsPanel';
 
 interface Message {
   id: string;

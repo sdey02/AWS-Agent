@@ -12,14 +12,20 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/gofiber/websocket/v2"
 	"go.uber.org/zap"
 
 	"github.com/aws-agent/backend/internal/api/handlers"
+	"github.com/aws-agent/backend/internal/aws/actions"
+	"github.com/aws-agent/backend/internal/cache/redis"
+	"github.com/aws-agent/backend/internal/evaluation"
 	"github.com/aws-agent/backend/internal/ingestion"
 	"github.com/aws-agent/backend/internal/kg/builder"
 	"github.com/aws-agent/backend/internal/kg/neo4j"
 	"github.com/aws-agent/backend/internal/llm"
+	"github.com/aws-agent/backend/internal/metrics"
 	"github.com/aws-agent/backend/internal/query"
+	"github.com/aws-agent/backend/internal/search/web"
 	"github.com/aws-agent/backend/internal/storage/sqlite"
 	"github.com/aws-agent/backend/internal/vector/zilliz"
 	"github.com/aws-agent/backend/pkg/config"
@@ -40,7 +46,9 @@ func main() {
 	}
 	defer appLogger.Sync()
 
-	appLogger.Info("Starting AWS RAG Agent API Server")
+	appLogger.Info("Starting AWS RAG Agent API Server with Enhanced Features")
+
+	metrics.Init()
 
 	sqliteClient, err := sqlite.NewClient(cfg.SQLite.Path)
 	if err != nil {
@@ -80,6 +88,18 @@ func main() {
 		appLogger.Fatal("Failed to create collection", zap.Error(err))
 	}
 
+	redisClient, err := redis.NewClient(
+		cfg.Redis.Host,
+		cfg.Redis.Port,
+		cfg.Redis.Password,
+		cfg.Redis.DB,
+	)
+	if err != nil {
+		appLogger.Warn("Failed to create Redis client, continuing without cache", zap.Error(err))
+	} else {
+		defer redisClient.Close()
+	}
+
 	llmClient := llm.NewClient(
 		cfg.LLM.APIKey,
 		cfg.LLM.Model,
@@ -94,8 +114,11 @@ func main() {
 		appLogger.Warn("Failed to initialize seed concepts", zap.Error(err))
 	}
 
+	webSearchClient := web.NewClient(cfg.Search.SerpAPIKey, llmClient)
 	processor := ingestion.NewProcessor(sqliteClient, zillizClient, llmClient)
 	queryEngine := query.NewEngine(sqliteClient, neo4jClient, zillizClient, llmClient)
+	evaluator := evaluation.NewEvaluator(sqliteClient, llmClient)
+	actionsExecutor := actions.NewExecutor(llmClient, true)
 
 	app := fiber.New(fiber.Config{
 		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * time.Second,
@@ -113,18 +136,34 @@ func main() {
 
 	queryHandler := handlers.NewQueryHandler(queryEngine)
 	documentHandler := handlers.NewDocumentHandler(processor)
+	wsHandler := handlers.NewWebSocketHandler(queryEngine)
+	actionsHandler := handlers.NewActionsHandler(actionsExecutor)
 
 	api := app.Group("/api/v1")
 
 	api.Post("/query", queryHandler.HandleQuery)
 	api.Get("/query/history", queryHandler.GetQueryHistory)
 
+	api.Get("/ws", websocket.New(wsHandler.HandleConnection))
+
 	api.Post("/documents", documentHandler.UploadDocument)
+
+	api.Post("/actions/plan", actionsHandler.PlanActions)
+	api.Post("/actions/execute", actionsHandler.ExecuteActions)
+
+	api.Get("/metrics", metrics.MetricsHandler())
 
 	api.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"status": "healthy",
 			"time":   time.Now().Unix(),
+			"features": map[string]bool{
+				"redis_cache":    redisClient != nil,
+				"web_search":     cfg.Search.Enabled,
+				"websocket":      true,
+				"aws_actions":    true,
+				"metrics":        true,
+			},
 		})
 	})
 
@@ -135,7 +174,13 @@ func main() {
 	})
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	appLogger.Info("Server starting", zap.String("address", addr))
+	appLogger.Info("Server starting with enhanced features",
+		zap.String("address", addr),
+		zap.Bool("redis_cache", redisClient != nil),
+		zap.Bool("web_search", cfg.Search.Enabled),
+		zap.Bool("websocket", true),
+		zap.Bool("aws_actions", true),
+	)
 
 	go func() {
 		if err := app.Listen(addr); err != nil {
