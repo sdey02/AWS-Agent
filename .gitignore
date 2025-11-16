@@ -1,0 +1,39 @@
+# Environment variables
+.env
+.env.local
+
+# Backend
+backend/api
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.turbo/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+*.tar
+
+# Test coverage
+coverage/
+*.coverprofile

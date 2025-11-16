@@ -1,0 +1,49 @@
+server:
+  host: 0.0.0.0
+  port: 8080
+  readTimeout: 30
+  writeTimeout: 30
+  bodyLimit: 10485760
+
+neo4j:
+  uri: bolt://neo4j:7687
+  username: neo4j
+  password: password
+  database: neo4j
+
+zilliz:
+  endpoint: milvus-standalone:19530
+  apiKey: ""
+  collectionName: aws_docs
+  vectorDim: 1536
+  indexType: IVF_FLAT
+
+sqlite:
+  path: ./data/awsrag.db
+
+redis:
+  host: redis
+  port: 6379
+  password: ""
+  db: 0
+
+llm:
+  provider: openai
+  model: gpt-4
+  apiKey: ${OPENAI_API_KEY}
+  temperature: 0.2
+  maxTokens: 2048
+  timeoutSec: 60
+  embeddingModel: text-embedding-3-large
+  embeddingDim: 1536
+
+search:
+  enabled: true
+  serpAPIKey: ${SERP_API_KEY}
+  maxResults: 5
+  timeoutSec: 10
+
+logging:
+  level: info
+  format: json
+  outputPath: stdout
