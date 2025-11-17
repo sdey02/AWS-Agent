@@ -4,6 +4,8 @@ server:
   readTimeout: 30
   writeTimeout: 30
   bodyLimit: 10485760
+  allowedOrigins: "http://localhost:3000"
+  environment: development
 
 neo4j:
   uri: bolt://neo4j:7687

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -24,6 +25,9 @@ import (
 	"github.com/aws-agent/backend/internal/kg/neo4j"
 	"github.com/aws-agent/backend/internal/llm"
 	"github.com/aws-agent/backend/internal/metrics"
+	"github.com/aws-agent/backend/internal/middleware/ratelimit"
+	"github.com/aws-agent/backend/internal/middleware/security"
+	"github.com/aws-agent/backend/internal/middleware/validation"
 	"github.com/aws-agent/backend/internal/query"
 	"github.com/aws-agent/backend/internal/search/web"
 	"github.com/aws-agent/backend/internal/storage/sqlite"
@@ -55,6 +59,10 @@ func main() {
 		appLogger.Fatal("Failed to create SQLite client", zap.Error(err))
 	}
 	defer sqliteClient.Close()
+
+	sqliteClient.DB.SetMaxOpenConns(25)
+	sqliteClient.DB.SetMaxIdleConns(5)
+	sqliteClient.DB.SetConnMaxLifetime(5 * time.Minute)
 
 	err = sqliteClient.InitSchema()
 	if err != nil {
@@ -124,14 +132,46 @@ func main() {
 		ReadTimeout:  time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout: time.Duration(cfg.Server.WriteTimeout) * time.Second,
 		BodyLimit:    cfg.Server.BodyLimit,
+		ServerHeader: "AWS-RAG-Agent",
+		AppName:      "AWS RAG Agent v2.0",
 	})
 
 	app.Use(recover.New())
 	app.Use(logger.New())
+
+	allowedOrigins := "http://localhost:3000"
+	if cfg.Server.AllowedOrigins != "" {
+		allowedOrigins = cfg.Server.AllowedOrigins
+	}
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
-		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
+		AllowOrigins:     allowedOrigins,
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-User-ID",
+		AllowMethods:     "GET, POST, PUT, DELETE, OPTIONS",
+		AllowCredentials: true,
+		MaxAge:           3600,
+	}))
+
+	app.Use(security.HeadersMiddleware(security.HeadersConfig{
+		AllowedOrigins: []string{allowedOrigins},
+		IsDevelopment:  cfg.Server.Environment == "development",
+	}))
+
+	app.Use(compress.New(compress.Config{
+		Level: compress.LevelBestSpeed,
+	}))
+
+	rateLimiter := ratelimit.New(ratelimit.Config{
+		MaxRequestsPerMinute: 60,
+		WindowDuration:       time.Minute,
+		Logger:               appLogger.GetLogger(),
+	})
+	app.Use(rateLimiter.Middleware())
+
+	app.Use(validation.Middleware(validation.Config{
+		MaxQueryLength:      5000,
+		MaxDocumentSize:     10 * 1024 * 1024,
+		AllowedContentTypes: []string{"application/json", "multipart/form-data"},
+		Logger:              appLogger.GetLogger(),
 	}))
 
 	queryHandler := handlers.NewQueryHandler(queryEngine)
@@ -193,6 +233,32 @@ func main() {
 	<-quit
 
 	appLogger.Info("Server shutting down gracefully...")
-	app.Shutdown()
-	appLogger.Info("Server stopped")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if redisClient != nil {
+		appLogger.Info("Closing Redis connection...")
+		redisClient.Close()
+	}
+
+	if err := neo4jClient.Close(shutdownCtx); err != nil {
+		appLogger.Error("Error closing Neo4j connection", zap.Error(err))
+	}
+
+	if err := zillizClient.Close(); err != nil {
+		appLogger.Error("Error closing Zilliz connection", zap.Error(err))
+	}
+
+	if err := sqliteClient.Close(); err != nil {
+		appLogger.Error("Error closing SQLite connection", zap.Error(err))
+	}
+
+	rateLimiter.Stop()
+
+	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+		appLogger.Error("Error during server shutdown", zap.Error(err))
+	}
+
+	appLogger.Info("Server stopped successfully")
 }

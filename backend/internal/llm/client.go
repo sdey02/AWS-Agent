@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 	"go.uber.org/zap"
 
+	"github.com/aws-agent/backend/pkg/circuitbreaker"
 	"github.com/aws-agent/backend/pkg/logger"
+	"github.com/aws-agent/backend/pkg/retry"
 )
 
 type Client struct {
@@ -17,6 +20,8 @@ type Client struct {
 	embeddingModel string
 	temperature    float32
 	maxTokens      int
+	cb             *circuitbreaker.CircuitBreaker
+	retryConfig    retry.Config
 }
 
 type CompletionRequest struct {
@@ -40,6 +45,24 @@ type Usage struct {
 func NewClient(apiKey, model, embeddingModel string, temperature float32, maxTokens int) *Client {
 	client := openai.NewClient(apiKey)
 
+	cb := circuitbreaker.NewCircuitBreaker("llm", circuitbreaker.Config{
+		MaxRequests:      5,
+		Interval:         time.Minute,
+		Timeout:          30 * time.Second,
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		Logger:           logger.GetLogger(),
+	})
+
+	retryConfig := retry.Config{
+		MaxAttempts:    3,
+		InitialDelay:   500 * time.Millisecond,
+		MaxDelay:       5 * time.Second,
+		Multiplier:     2.0,
+		JitterFraction: 0.1,
+		Logger:         logger.GetLogger(),
+	}
+
 	logger.Info("LLM client initialized",
 		zap.String("model", model),
 		zap.String("embedding_model", embeddingModel),
@@ -51,10 +74,15 @@ func NewClient(apiKey, model, embeddingModel string, temperature float32, maxTok
 		embeddingModel: embeddingModel,
 		temperature:    temperature,
 		maxTokens:      maxTokens,
+		cb:             cb,
+		retryConfig:    retryConfig,
 	}
 }
 
 func (c *Client) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	temperature := req.Temperature
 	if temperature == 0 {
 		temperature = c.temperature
@@ -76,54 +104,138 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (*Completi
 		},
 	}
 
-	resp, err := c.client.CreateChatCompletion(
-		ctx,
-		openai.ChatCompletionRequest{
-			Model:       c.model,
-			Messages:    messages,
-			Temperature: temperature,
-			MaxTokens:   maxTokens,
-		},
-	)
+	var result *CompletionResponse
+
+	err := c.cb.Execute(ctx, func() error {
+		return retry.Do(ctx, c.retryConfig, func() error {
+			resp, err := c.client.CreateChatCompletion(
+				ctx,
+				openai.ChatCompletionRequest{
+					Model:       c.model,
+					Messages:    messages,
+					Temperature: temperature,
+					MaxTokens:   maxTokens,
+				},
+			)
+
+			if err != nil {
+				return fmt.Errorf("failed to create completion: %w", err)
+			}
+
+			logger.Debug("LLM completion generated",
+				zap.Int("prompt_tokens", resp.Usage.PromptTokens),
+				zap.Int("completion_tokens", resp.Usage.CompletionTokens),
+			)
+
+			result = &CompletionResponse{
+				Content: resp.Choices[0].Message.Content,
+				Usage: Usage{
+					PromptTokens:     resp.Usage.PromptTokens,
+					CompletionTokens: resp.Usage.CompletionTokens,
+					TotalTokens:      resp.Usage.TotalTokens,
+				},
+			}
+
+			return nil
+		})
+	})
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to create completion: %w", err)
+		return nil, err
 	}
 
-	logger.Debug("LLM completion generated",
-		zap.Int("prompt_tokens", resp.Usage.PromptTokens),
-		zap.Int("completion_tokens", resp.Usage.CompletionTokens),
-	)
-
-	return &CompletionResponse{
-		Content: resp.Choices[0].Message.Content,
-		Usage: Usage{
-			PromptTokens:     resp.Usage.PromptTokens,
-			CompletionTokens: resp.Usage.CompletionTokens,
-			TotalTokens:      resp.Usage.TotalTokens,
-		},
-	}, nil
+	return result, nil
 }
 
 func (c *Client) GenerateEmbedding(ctx context.Context, text string) ([]float32, error) {
-	resp, err := c.client.CreateEmbeddings(
-		ctx,
-		openai.EmbeddingRequest{
-			Input: []string{text},
-			Model: openai.EmbeddingModel(c.embeddingModel),
-		},
-	)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	var embedding []float32
+
+	err := c.cb.Execute(ctx, func() error {
+		return retry.Do(ctx, c.retryConfig, func() error {
+			resp, err := c.client.CreateEmbeddings(
+				ctx,
+				openai.EmbeddingRequest{
+					Input: []string{text},
+					Model: openai.EmbeddingModel(c.embeddingModel),
+				},
+			)
+
+			if err != nil {
+				return fmt.Errorf("failed to generate embedding: %w", err)
+			}
+
+			embedding = make([]float32, len(resp.Data[0].Embedding))
+			for i, v := range resp.Data[0].Embedding {
+				embedding[i] = v
+			}
+
+			return nil
+		})
+	})
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate embedding: %w", err)
-	}
-
-	embedding := make([]float32, len(resp.Data[0].Embedding))
-	for i, v := range resp.Data[0].Embedding {
-		embedding[i] = v
+		return nil, err
 	}
 
 	return embedding, nil
+}
+
+func (c *Client) GenerateBatchEmbeddings(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var embeddings [][]float32
+
+	batchSize := 100
+	for i := 0; i < len(texts); i += batchSize {
+		end := i + batchSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+
+		batch := texts[i:end]
+
+		err := c.cb.Execute(ctx, func() error {
+			return retry.Do(ctx, c.retryConfig, func() error {
+				resp, err := c.client.CreateEmbeddings(
+					ctx,
+					openai.EmbeddingRequest{
+						Input: batch,
+						Model: openai.EmbeddingModel(c.embeddingModel),
+					},
+				)
+
+				if err != nil {
+					return fmt.Errorf("failed to generate batch embeddings: %w", err)
+				}
+
+				for _, data := range resp.Data {
+					embedding := make([]float32, len(data.Embedding))
+					for j, v := range data.Embedding {
+						embedding[j] = v
+					}
+					embeddings = append(embeddings, embedding)
+				}
+
+				return nil
+			})
+		})
+
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	logger.Debug("Batch embeddings generated", zap.Int("count", len(embeddings)))
+
+	return embeddings, nil
 }
 
 func (c *Client) SummarizeDocument(ctx context.Context, content string) (string, error) {

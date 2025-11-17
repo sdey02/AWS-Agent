@@ -75,18 +75,21 @@ func (p *Processor) ProcessDocument(ctx context.Context, url, htmlContent string
 	chunks := p.chunkText(cleanedText)
 	logger.Info("Document chunked", zap.Int("chunks", len(chunks)))
 
+	embeddings, err := p.llmClient.GenerateBatchEmbeddings(ctx, chunks)
+	if err != nil {
+		return fmt.Errorf("failed to generate embeddings: %w", err)
+	}
+
+	if len(embeddings) != len(chunks) {
+		return fmt.Errorf("embedding count mismatch: got %d, expected %d", len(embeddings), len(chunks))
+	}
+
 	vectorChunks := make([]zilliz.DocumentChunk, 0, len(chunks))
 	for i, chunkText := range chunks {
-		embedding, err := p.llmClient.GenerateEmbedding(ctx, chunkText)
-		if err != nil {
-			logger.Error("Failed to generate embedding", zap.Error(err))
-			continue
-		}
-
 		chunkID := fmt.Sprintf("%s_chunk_%d", docID, i)
 		vectorChunk := zilliz.DocumentChunk{
 			ID:         chunkID,
-			Embedding:  embedding,
+			Embedding:  embeddings[i],
 			Text:       chunkText,
 			DocURL:     url,
 			AWSService: awsService,

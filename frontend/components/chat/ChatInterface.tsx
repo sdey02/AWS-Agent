@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import MessageBubble from './MessageBubble';
 import SourceCard from './SourceCard';
 import FeedbackButton from './FeedbackButton';
@@ -12,6 +12,7 @@ interface Message {
   content: string;
   sources?: Source[];
   confidence?: number;
+  isStreaming?: boolean;
 }
 
 interface Source {
@@ -25,21 +26,91 @@ export default function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [useWebSocket, setUseWebSocket] = useState(true);
+  const wsRef = useRef<WebSocket | null>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isLoading) return;
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
 
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: input,
+  const handleSubmitWebSocket = (query: string) => {
+    const ws = new WebSocket('ws://localhost:8080/api/v1/ws');
+    wsRef.current = ws;
+
+    const assistantMessageId = Date.now().toString();
+    let currentContent = '';
+
+    const assistantMessage: Message = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      isStreaming: true,
     };
 
-    setMessages(prev => [...prev, userMessage]);
-    setInput('');
-    setIsLoading(true);
+    setMessages(prev => [...prev, assistantMessage]);
 
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        query,
+        user_id: 'default_user',
+      }));
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'chunk') {
+        currentContent += data.content;
+        setMessages(prev => prev.map(msg =>
+          msg.id === assistantMessageId
+            ? { ...msg, content: currentContent }
+            : msg
+        ));
+      } else if (data.type === 'sources') {
+        setMessages(prev => prev.map(msg =>
+          msg.id === assistantMessageId
+            ? { ...msg, sources: data.sources }
+            : msg
+        ));
+      } else if (data.type === 'complete') {
+        setMessages(prev => prev.map(msg =>
+          msg.id === assistantMessageId
+            ? { ...msg, confidence: data.confidence, isStreaming: false }
+            : msg
+        ));
+        setIsLoading(false);
+        ws.close();
+      } else if (data.type === 'error') {
+        setMessages(prev => prev.map(msg =>
+          msg.id === assistantMessageId
+            ? { ...msg, content: `Error: ${data.message}`, isStreaming: false }
+            : msg
+        ));
+        setIsLoading(false);
+        ws.close();
+      }
+    };
+
+    ws.onerror = () => {
+      setMessages(prev => prev.map(msg =>
+        msg.id === assistantMessageId
+          ? { ...msg, content: 'WebSocket connection error. Falling back to HTTP.', isStreaming: false }
+          : msg
+      ));
+      setIsLoading(false);
+      setUseWebSocket(false);
+    };
+
+    ws.onclose = () => {
+      wsRef.current = null;
+    };
+  };
+
+  const handleSubmitHTTP = async (query: string) => {
     try {
       const response = await fetch('http://localhost:8080/api/v1/query', {
         method: 'POST',
@@ -47,7 +118,7 @@ export default function ChatInterface() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          query: input,
+          query,
           user_id: 'default_user',
         }),
       });
@@ -73,6 +144,28 @@ export default function ChatInterface() {
       setMessages(prev => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading) return;
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: input,
+    };
+
+    setMessages(prev => [...prev, userMessage]);
+    const query = input;
+    setInput('');
+    setIsLoading(true);
+
+    if (useWebSocket) {
+      handleSubmitWebSocket(query);
+    } else {
+      await handleSubmitHTTP(query);
     }
   };
 

@@ -3,15 +3,20 @@ package neo4j
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 	"go.uber.org/zap"
 
+	"github.com/aws-agent/backend/pkg/circuitbreaker"
 	"github.com/aws-agent/backend/pkg/logger"
+	"github.com/aws-agent/backend/pkg/retry"
 )
 
 type Client struct {
-	driver neo4j.DriverWithContext
+	driver      neo4j.DriverWithContext
+	cb          *circuitbreaker.CircuitBreaker
+	retryConfig retry.Config
 }
 
 type Entity struct {
@@ -53,13 +58,48 @@ func NewClient(uri, username, password, database string) (*Client, error) {
 		return nil, fmt.Errorf("failed to verify connectivity: %w", err)
 	}
 
+	cb := circuitbreaker.NewCircuitBreaker("neo4j", circuitbreaker.Config{
+		MaxRequests:      3,
+		Interval:         time.Minute,
+		Timeout:          20 * time.Second,
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		Logger:           logger.GetLogger(),
+	})
+
+	retryConfig := retry.Config{
+		MaxAttempts:    3,
+		InitialDelay:   200 * time.Millisecond,
+		MaxDelay:       3 * time.Second,
+		Multiplier:     2.0,
+		JitterFraction: 0.1,
+		Logger:         logger.GetLogger(),
+	}
+
 	logger.Info("Neo4j client initialized", zap.String("uri", uri))
 
-	return &Client{driver: driver}, nil
+	return &Client{
+		driver:      driver,
+		cb:          cb,
+		retryConfig: retryConfig,
+	}, nil
 }
 
 func (c *Client) Close(ctx context.Context) error {
 	return c.driver.Close(ctx)
+}
+
+func (c *Client) executeWithRetry(ctx context.Context, operation func(neo4j.SessionWithContext) error) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	return c.cb.Execute(ctx, func() error {
+		return retry.Do(ctx, c.retryConfig, func() error {
+			session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: "neo4j"})
+			defer session.Close(ctx)
+			return operation(session)
+		})
+	})
 }
 
 func (c *Client) CreateEntity(ctx context.Context, entity *Entity) error {
@@ -125,78 +165,84 @@ func (c *Client) CreateRelation(ctx context.Context, relation *Relation) error {
 }
 
 func (c *Client) SearchByEntities(ctx context.Context, entities []string, minConfidence float64) ([]Triple, error) {
-	session := c.driver.NewSession(ctx, neo4j.SessionConfig{DatabaseName: "neo4j"})
-	defer session.Close(ctx)
-
-	query := `
-		MATCH (s:Entity)-[r:RELATES]->(o:Entity)
-		WHERE (s.name IN $entities OR o.name IN $entities)
-		  AND r.confidence >= $min_confidence
-		RETURN s.id, s.name, s.type, s.canonical_name,
-		       r.type, r.confidence, r.source_docs,
-		       o.id, o.name, o.type, o.canonical_name
-		ORDER BY r.confidence DESC
-		LIMIT 20
-	`
-
-	result, err := session.Run(ctx, query, map[string]interface{}{
-		"entities":       entities,
-		"min_confidence": minConfidence,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to search by entities: %w", err)
-	}
-
 	var triples []Triple
-	for result.Next(ctx) {
-		record := result.Record()
 
-		subjectID, _ := record.Get("s.id")
-		subjectName, _ := record.Get("s.name")
-		subjectType, _ := record.Get("s.type")
-		subjectCanonical, _ := record.Get("s.canonical_name")
+	err := c.executeWithRetry(ctx, func(session neo4j.SessionWithContext) error {
+		query := `
+			MATCH (s:Entity)-[r:RELATES]->(o:Entity)
+			WHERE (s.name IN $entities OR o.name IN $entities)
+			  AND r.confidence >= $min_confidence
+			RETURN s.id, s.name, s.type, s.canonical_name,
+			       r.type, r.confidence, r.source_docs,
+			       o.id, o.name, o.type, o.canonical_name
+			ORDER BY r.confidence DESC
+			LIMIT 20
+		`
 
-		objectID, _ := record.Get("o.id")
-		objectName, _ := record.Get("o.name")
-		objectType, _ := record.Get("o.type")
-		objectCanonical, _ := record.Get("o.canonical_name")
+		result, err := session.Run(ctx, query, map[string]interface{}{
+			"entities":       entities,
+			"min_confidence": minConfidence,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to search by entities: %w", err)
+		}
 
-		predicate, _ := record.Get("r.type")
-		confidence, _ := record.Get("r.confidence")
-		sourceDocs, _ := record.Get("r.source_docs")
+		for result.Next(ctx) {
+			record := result.Record()
 
-		var sourceURLs []string
-		if docs, ok := sourceDocs.([]interface{}); ok {
-			for _, doc := range docs {
-				if url, ok := doc.(string); ok {
-					sourceURLs = append(sourceURLs, url)
+			subjectID, _ := record.Get("s.id")
+			subjectName, _ := record.Get("s.name")
+			subjectType, _ := record.Get("s.type")
+			subjectCanonical, _ := record.Get("s.canonical_name")
+
+			objectID, _ := record.Get("o.id")
+			objectName, _ := record.Get("o.name")
+			objectType, _ := record.Get("o.type")
+			objectCanonical, _ := record.Get("o.canonical_name")
+
+			predicate, _ := record.Get("r.type")
+			confidence, _ := record.Get("r.confidence")
+			sourceDocs, _ := record.Get("r.source_docs")
+
+			var sourceURLs []string
+			if docs, ok := sourceDocs.([]interface{}); ok {
+				for _, doc := range docs {
+					if url, ok := doc.(string); ok {
+						sourceURLs = append(sourceURLs, url)
+					}
 				}
 			}
+
+			triple := Triple{
+				Subject: Entity{
+					ID:            subjectID.(string),
+					Name:          subjectName.(string),
+					Type:          subjectType.(string),
+					CanonicalName: subjectCanonical.(string),
+				},
+				Predicate: predicate.(string),
+				Object: Entity{
+					ID:            objectID.(string),
+					Name:          objectName.(string),
+					Type:          objectType.(string),
+					CanonicalName: objectCanonical.(string),
+				},
+				Confidence: confidence.(float64),
+				SourceURLs: sourceURLs,
+			}
+
+			triples = append(triples, triple)
 		}
 
-		triple := Triple{
-			Subject: Entity{
-				ID:            subjectID.(string),
-				Name:          subjectName.(string),
-				Type:          subjectType.(string),
-				CanonicalName: subjectCanonical.(string),
-			},
-			Predicate: predicate.(string),
-			Object: Entity{
-				ID:            objectID.(string),
-				Name:          objectName.(string),
-				Type:          objectType.(string),
-				CanonicalName: objectCanonical.(string),
-			},
-			Confidence: confidence.(float64),
-			SourceURLs: sourceURLs,
+		if err = result.Err(); err != nil {
+			return fmt.Errorf("error iterating results: %w", err)
 		}
 
-		triples = append(triples, triple)
-	}
+		return nil
+	})
 
-	if err = result.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating results: %w", err)
+	if err != nil {
+		return nil, err
 	}
 
 	logger.Info("KG search completed",

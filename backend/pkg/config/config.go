@@ -19,11 +19,13 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host         string
-	Port         int
-	ReadTimeout  int
-	WriteTimeout int
-	BodyLimit    int
+	Host           string
+	Port           int
+	ReadTimeout    int
+	WriteTimeout   int
+	BodyLimit      int
+	AllowedOrigins string
+	Environment    string
 }
 
 type Neo4jConfig struct {
