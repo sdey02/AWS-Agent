@@ -9,18 +9,28 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"github.com/aws-agent/backend/pkg/circuitbreaker"
 	"github.com/aws-agent/backend/pkg/logger"
+	"github.com/aws-agent/backend/pkg/retry"
 )
 
 type Client struct {
-	client *redis.Client
+	client      *redis.Client
+	cb          *circuitbreaker.CircuitBreaker
+	retryConfig retry.Config
 }
 
 func NewClient(host string, port int, password string, db int) (*Client, error) {
 	client := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", host, port),
-		Password: password,
-		DB:       db,
+		Addr:         fmt.Sprintf("%s:%d", host, port),
+		Password:     password,
+		DB:           db,
+		PoolSize:     10,
+		MinIdleConns: 2,
+		MaxConnAge:   5 * time.Minute,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
 	})
 
 	ctx := context.Background()
@@ -29,9 +39,34 @@ func NewClient(host string, port int, password string, db int) (*Client, error) 
 		return nil, fmt.Errorf("failed to connect to redis: %w", err)
 	}
 
-	logger.Info("Redis client initialized", zap.String("addr", fmt.Sprintf("%s:%d", host, port)))
+	cb := circuitbreaker.NewCircuitBreaker("redis", circuitbreaker.Config{
+		MaxRequests:      3,
+		Interval:         time.Minute,
+		Timeout:          10 * time.Second,
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		Logger:           logger.GetLogger(),
+	})
 
-	return &Client{client: client}, nil
+	retryConfig := retry.Config{
+		MaxAttempts:    2,
+		InitialDelay:   50 * time.Millisecond,
+		MaxDelay:       500 * time.Millisecond,
+		Multiplier:     2.0,
+		JitterFraction: 0.1,
+		Logger:         logger.GetLogger(),
+	}
+
+	logger.Info("Redis client initialized",
+		zap.String("addr", fmt.Sprintf("%s:%d", host, port)),
+		zap.Int("pool_size", 10),
+	)
+
+	return &Client{
+		client:      client,
+		cb:          cb,
+		retryConfig: retryConfig,
+	}, nil
 }
 
 func (c *Client) Close() error {
@@ -54,12 +89,25 @@ func (c *Client) SetQuery(ctx context.Context, queryHash string, response interf
 }
 
 func (c *Client) GetQuery(ctx context.Context, queryHash string, response interface{}) (bool, error) {
-	data, err := c.client.Get(ctx, fmt.Sprintf("query:%s", queryHash)).Bytes()
-	if err == redis.Nil {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("failed to get query cache: %w", err)
+	var data []byte
+	var found bool
+
+	err := retry.Do(ctx, c.retryConfig, func() error {
+		var err error
+		data, err = c.client.Get(ctx, fmt.Sprintf("query:%s", queryHash)).Bytes()
+		if err == redis.Nil {
+			found = false
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to get query cache: %w", err)
+		}
+		found = true
+		return nil
+	})
+
+	if err != nil || !found {
+		return false, err
 	}
 
 	err = json.Unmarshal(data, response)

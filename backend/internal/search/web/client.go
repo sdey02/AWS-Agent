@@ -14,13 +14,17 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/aws-agent/backend/internal/llm"
+	"github.com/aws-agent/backend/pkg/circuitbreaker"
 	"github.com/aws-agent/backend/pkg/logger"
+	"github.com/aws-agent/backend/pkg/retry"
 )
 
 type Client struct {
-	serpAPIKey string
-	llmClient  *llm.Client
-	httpClient *http.Client
+	serpAPIKey  string
+	llmClient   *llm.Client
+	httpClient  *http.Client
+	cb          *circuitbreaker.CircuitBreaker
+	retryConfig retry.Config
 }
 
 type SearchResult struct {
@@ -31,12 +35,32 @@ type SearchResult struct {
 }
 
 func NewClient(serpAPIKey string, llmClient *llm.Client) *Client {
+	cb := circuitbreaker.NewCircuitBreaker("web_search", circuitbreaker.Config{
+		MaxRequests:      3,
+		Interval:         time.Minute,
+		Timeout:          15 * time.Second,
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		Logger:           logger.GetLogger(),
+	})
+
+	retryConfig := retry.Config{
+		MaxAttempts:    2,
+		InitialDelay:   500 * time.Millisecond,
+		MaxDelay:       2 * time.Second,
+		Multiplier:     2.0,
+		JitterFraction: 0.1,
+		Logger:         logger.GetLogger(),
+	}
+
 	return &Client{
 		serpAPIKey: serpAPIKey,
 		llmClient:  llmClient,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		cb:          cb,
+		retryConfig: retryConfig,
 	}
 }
 

@@ -9,13 +9,17 @@ import (
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 	"go.uber.org/zap"
 
+	"github.com/aws-agent/backend/pkg/circuitbreaker"
 	"github.com/aws-agent/backend/pkg/logger"
+	"github.com/aws-agent/backend/pkg/retry"
 )
 
 type Client struct {
 	client         client.Client
 	collectionName string
 	vectorDim      int
+	cb             *circuitbreaker.CircuitBreaker
+	retryConfig    retry.Config
 }
 
 type DocumentChunk struct {
@@ -48,6 +52,24 @@ func NewClient(endpoint, apiKey, collectionName string, vectorDim int) (*Client,
 		return nil, fmt.Errorf("failed to create milvus client: %w", err)
 	}
 
+	cb := circuitbreaker.NewCircuitBreaker("zilliz", circuitbreaker.Config{
+		MaxRequests:      3,
+		Interval:         time.Minute,
+		Timeout:          20 * time.Second,
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		Logger:           logger.GetLogger(),
+	})
+
+	retryConfig := retry.Config{
+		MaxAttempts:    3,
+		InitialDelay:   200 * time.Millisecond,
+		MaxDelay:       3 * time.Second,
+		Multiplier:     2.0,
+		JitterFraction: 0.1,
+		Logger:         logger.GetLogger(),
+	}
+
 	logger.Info("Zilliz/Milvus client initialized",
 		zap.String("endpoint", endpoint),
 		zap.String("collection", collectionName),
@@ -57,6 +79,8 @@ func NewClient(endpoint, apiKey, collectionName string, vectorDim int) (*Client,
 		client:         c,
 		collectionName: collectionName,
 		vectorDim:      vectorDim,
+		cb:             cb,
+		retryConfig:    retryConfig,
 	}, nil
 }
 
@@ -163,118 +187,140 @@ func (z *Client) Insert(ctx context.Context, chunks []DocumentChunk) error {
 		return nil
 	}
 
-	chunkIDs := make([]string, len(chunks))
-	embeddings := make([][]float32, len(chunks))
-	texts := make([]string, len(chunks))
-	docURLs := make([]string, len(chunks))
-	services := make([]string, len(chunks))
-	docTypes := make([]string, len(chunks))
-	summaries := make([]string, len(chunks))
-	timestamps := make([]int64, len(chunks))
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 
-	for i, chunk := range chunks {
-		chunkIDs[i] = chunk.ID
-		embeddings[i] = chunk.Embedding
-		texts[i] = chunk.Text
-		docURLs[i] = chunk.DocURL
-		services[i] = chunk.AWSService
-		docTypes[i] = chunk.DocType
-		summaries[i] = chunk.Summary
-		timestamps[i] = chunk.Timestamp.Unix()
-	}
+	return z.cb.Execute(ctx, func() error {
+		return retry.Do(ctx, z.retryConfig, func() error {
+			chunkIDs := make([]string, len(chunks))
+			embeddings := make([][]float32, len(chunks))
+			texts := make([]string, len(chunks))
+			docURLs := make([]string, len(chunks))
+			services := make([]string, len(chunks))
+			docTypes := make([]string, len(chunks))
+			summaries := make([]string, len(chunks))
+			timestamps := make([]int64, len(chunks))
 
-	_, err := z.client.Insert(
-		ctx,
-		z.collectionName,
-		"",
-		entity.NewColumnVarChar("chunk_id", chunkIDs),
-		entity.NewColumnFloatVector("embedding", z.vectorDim, embeddings),
-		entity.NewColumnVarChar("text", texts),
-		entity.NewColumnVarChar("doc_url", docURLs),
-		entity.NewColumnVarChar("aws_service", services),
-		entity.NewColumnVarChar("doc_type", docTypes),
-		entity.NewColumnVarChar("summary", summaries),
-		entity.NewColumnInt64("timestamp", timestamps),
-	)
+			for i, chunk := range chunks {
+				chunkIDs[i] = chunk.ID
+				embeddings[i] = chunk.Embedding
+				texts[i] = chunk.Text
+				docURLs[i] = chunk.DocURL
+				services[i] = chunk.AWSService
+				docTypes[i] = chunk.DocType
+				summaries[i] = chunk.Summary
+				timestamps[i] = chunk.Timestamp.Unix()
+			}
 
-	if err != nil {
-		return fmt.Errorf("failed to insert chunks: %w", err)
-	}
+			_, err := z.client.Insert(
+				ctx,
+				z.collectionName,
+				"",
+				entity.NewColumnVarChar("chunk_id", chunkIDs),
+				entity.NewColumnFloatVector("embedding", z.vectorDim, embeddings),
+				entity.NewColumnVarChar("text", texts),
+				entity.NewColumnVarChar("doc_url", docURLs),
+				entity.NewColumnVarChar("aws_service", services),
+				entity.NewColumnVarChar("doc_type", docTypes),
+				entity.NewColumnVarChar("summary", summaries),
+				entity.NewColumnInt64("timestamp", timestamps),
+			)
 
-	err = z.client.Flush(ctx, z.collectionName, false)
-	if err != nil {
-		return fmt.Errorf("failed to flush: %w", err)
-	}
+			if err != nil {
+				return fmt.Errorf("failed to insert chunks: %w", err)
+			}
 
-	logger.Info("Chunks inserted into vector DB", zap.Int("count", len(chunks)))
+			err = z.client.Flush(ctx, z.collectionName, false)
+			if err != nil {
+				return fmt.Errorf("failed to flush: %w", err)
+			}
 
-	return nil
+			logger.Info("Chunks inserted into vector DB", zap.Int("count", len(chunks)))
+
+			return nil
+		})
+	})
 }
 
 func (z *Client) Search(ctx context.Context, queryEmbedding []float32, topK int, filters map[string]string) ([]SearchResult, error) {
-	expr := ""
-	if service, ok := filters["aws_service"]; ok && service != "" {
-		expr = fmt.Sprintf(`aws_service == "%s"`, service)
-	}
-	if docType, ok := filters["doc_type"]; ok && docType != "" {
-		if expr != "" {
-			expr += " && "
-		}
-		expr += fmt.Sprintf(`doc_type == "%s"`, docType)
-	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	sp, _ := entity.NewIndexIVFFlatSearchParam(16)
+	var results []SearchResult
 
-	searchResult, err := z.client.Search(
-		ctx,
-		z.collectionName,
-		[]string{},
-		expr,
-		[]string{"chunk_id", "text", "doc_url", "aws_service", "doc_type", "summary"},
-		[]entity.Vector{entity.FloatVector(queryEmbedding)},
-		"embedding",
-		entity.L2,
-		topK,
-		sp,
-	)
+	err := z.cb.Execute(ctx, func() error {
+		return retry.Do(ctx, z.retryConfig, func() error {
+			expr := ""
+			if service, ok := filters["aws_service"]; ok && service != "" {
+				expr = fmt.Sprintf(`aws_service == "%s"`, service)
+			}
+			if docType, ok := filters["doc_type"]; ok && docType != "" {
+				if expr != "" {
+					expr += " && "
+				}
+				expr += fmt.Sprintf(`doc_type == "%s"`, docType)
+			}
+
+			sp, _ := entity.NewIndexIVFFlatSearchParam(16)
+
+			searchResult, err := z.client.Search(
+				ctx,
+				z.collectionName,
+				[]string{},
+				expr,
+				[]string{"chunk_id", "text", "doc_url", "aws_service", "doc_type", "summary"},
+				[]entity.Vector{entity.FloatVector(queryEmbedding)},
+				"embedding",
+				entity.L2,
+				topK,
+				sp,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to search: %w", err)
+			}
+
+			results = make([]SearchResult, 0)
+			for _, sr := range searchResult {
+				for i := 0; i < sr.ResultCount; i++ {
+					chunkIDCol := sr.Fields.GetColumn("chunk_id")
+					textCol := sr.Fields.GetColumn("text")
+					docURLCol := sr.Fields.GetColumn("doc_url")
+					serviceCol := sr.Fields.GetColumn("aws_service")
+					docTypeCol := sr.Fields.GetColumn("doc_type")
+					summaryCol := sr.Fields.GetColumn("summary")
+
+					chunkID, _ := chunkIDCol.Get(i)
+					text, _ := textCol.Get(i)
+					docURL, _ := docURLCol.Get(i)
+					service, _ := serviceCol.Get(i)
+					docType, _ := docTypeCol.Get(i)
+					summary, _ := summaryCol.Get(i)
+
+					results = append(results, SearchResult{
+						ChunkID:    chunkID.(string),
+						Text:       text.(string),
+						DocURL:     docURL.(string),
+						AWSService: service.(string),
+						DocType:    docType.(string),
+						Summary:    summary.(string),
+						Score:      sr.Scores[i],
+					})
+				}
+			}
+
+			logger.Info("Vector search completed",
+				zap.Int("topK", topK),
+				zap.Int("results", len(results)),
+				zap.String("filters", expr),
+			)
+
+			return nil
+		})
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to search: %w", err)
+		return nil, err
 	}
-
-	results := make([]SearchResult, 0)
-	for _, sr := range searchResult {
-		for i := 0; i < sr.ResultCount; i++ {
-			chunkIDCol := sr.Fields.GetColumn("chunk_id")
-			textCol := sr.Fields.GetColumn("text")
-			docURLCol := sr.Fields.GetColumn("doc_url")
-			serviceCol := sr.Fields.GetColumn("aws_service")
-			docTypeCol := sr.Fields.GetColumn("doc_type")
-			summaryCol := sr.Fields.GetColumn("summary")
-
-			chunkID, _ := chunkIDCol.Get(i)
-			text, _ := textCol.Get(i)
-			docURL, _ := docURLCol.Get(i)
-			service, _ := serviceCol.Get(i)
-			docType, _ := docTypeCol.Get(i)
-			summary, _ := summaryCol.Get(i)
-
-			results = append(results, SearchResult{
-				ChunkID:    chunkID.(string),
-				Text:       text.(string),
-				DocURL:     docURL.(string),
-				AWSService: service.(string),
-				DocType:    docType.(string),
-				Summary:    summary.(string),
-				Score:      sr.Scores[i],
-			})
-		}
-	}
-
-	logger.Info("Vector search completed",
-		zap.Int("topK", topK),
-		zap.Int("results", len(results)),
-		zap.String("filters", expr),
-	)
 
 	return results, nil
 }
